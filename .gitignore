@@ -1,0 +1,7 @@
+build/
+.tmp/
+ultraone.apk
+ultraone.apk.idsig
+debug.keystore
+*.class
+.ref-g1/
