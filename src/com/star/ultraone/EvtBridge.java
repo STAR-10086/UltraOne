@@ -27,6 +27,8 @@ public final class EvtBridge {
             @Override public void onReceive(Context ctx, Intent i) {
                 String msg = i.getStringExtra("msg");
                 if (msg != null) LogBus.append(msg);
+                String rows = i.getStringExtra("rows");
+                if (rows != null) saveRows(ctx, rows);
             }
         };
         IntentFilter f = new IntentFilter(Main.EVT);
@@ -37,6 +39,24 @@ public final class EvtBridge {
             receiver = null;
             LogBus.append("注册 EVT 失败 " + t);
         }
+    }
+
+    /** 结构化汇总存盘，界面下次打开就能直接画卡片 */
+    static void saveRows(Context c, String json) {
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray(json);
+            java.util.List<SummaryStore.Row> rows = new java.util.ArrayList<SummaryStore.Row>();
+            for (int i = 0; i < arr.length(); i++) {
+                org.json.JSONObject o = arr.getJSONObject(i);
+                SummaryStore.Row r = new SummaryStore.Row();
+                r.tier = o.optString("tier", "");
+                r.sku = o.optString("sku", "");
+                r.offer = o.optString("offer", "");
+                r.months = o.optInt("months", 0);
+                rows.add(r);
+            }
+            SummaryStore.save(c, rows);
+        } catch (Throwable t) { LogBus.append("保存汇总失败 " + t); }
     }
 
     public static synchronized void detach(Context c) {

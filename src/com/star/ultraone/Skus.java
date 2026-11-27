@@ -287,6 +287,10 @@ public final class Skus {
             if (s.contains("6mo")) return 6;
             if (s.contains("3mo")) return 3;
             if (s.contains("1mo")) return 1;
+            // 1year_eft / 2years → 按年换算
+            java.util.regex.Matcher y = java.util.regex.Pattern
+                    .compile("(\\d+)\\s*year").matcher(s);
+            if (y.find()) return Integer.parseInt(y.group(1)) * 12;
             if (s.contains("year")) return 12;
         } catch (Throwable ignored) { }
         return 0;

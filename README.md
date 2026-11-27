@@ -68,7 +68,40 @@ UltraOne 进程 ◀──EVT 广播── Google One 进程
 
 同一 SKU 下的多个 offer（如 `subs_variant` 的四段）会全部列出，按"免费优先 + 月数"排序。
 
-### 3.2 一键方案
+### 3.2 「这个账号能白拿什么」汇总
+
+扫描完成后，模块不再只堆 SKU 列表，而是**按档位归并**告诉你结论。悬浮窗或应用里点 **「能拿什么」** 随时重看：
+
+```
+╔══════════════════════════════════
+║ 这个账号现在能拿到的免费订阅
+║ 共 6 个档位 · 41 个免费 offer
+╚══════════════════════════════════
+
+【Google AI Pro 5TB】
+     18 个月  2tb.ai.18months_eft  [eft-18months]
+     15 个月  2tb.ai.15months_eft  [eft-15months]
+     12 个月  2tb.ai.12months_eft  [eft-12months]
+     12 个月  2tb.ai.subs_variant  [12months-eft]
+   …还有 8 个 SKU
+   ▶ 最长 18 个月
+
+────── 结论 ──────
+最划算：Google AI Pro 5TB · 18 个月 $0
+```
+
+应用主界面会把同一份数据渲染成**卡片**：每行显示「几个月 / SKU / offerId」，右侧「开这个」直接拉起收银台。
+
+归并规则：
+
+- 同一档位下十几个 SKU 只列最优的 3 条，避免刷屏
+- `freetrial` / 基础档这类不带数字的 offer，月数从 SKU 名里读（`g1.2tb.1year_eft` → 12 个月）
+- 月数推断优先级：offerId 数字 → SKU 名数字 → `billingPeriod`（P1Y / P6M）
+- 档位排序：AI Pro → Ultra → 2TB → 200GB → 100GB → 30GB
+
+汇总结果存进 `SharedPreferences`，进程被杀、重装模块都不丢，下次打开应用直接显示上次扫描的结论。日志同样落盘到 `Android/data/com.star.ultraone/files/ultraone.log`。
+
+### 3.3 一键方案
 
 悬浮窗底部是一条横向滚动的方案条，点一下 = 一次 `launchBillingFlow`，直接拉起 Play 收银台。
 

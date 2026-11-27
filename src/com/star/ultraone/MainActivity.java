@@ -25,10 +25,12 @@ public class MainActivity extends Activity implements LogBus.Sink {
     private static final int DIM = 0xFF8A91A3;
     private static final int ACCENT = 0xFF4C8DFF;
     private static final int WARN = 0xFFF5A524;
+    private static final int GREEN = 0xFF3DDC84;
 
     private TextView logView;
     private TextView permView;
     private ScrollView logScroll;
+    private LinearLayout summaryBox;
 
     private int dp(float v) { return (int) (v * getResources().getDisplayMetrics().density); }
 
@@ -41,6 +43,7 @@ public class MainActivity extends Activity implements LogBus.Sink {
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
+        LogBus.init(this);
         build();
         LogBus.addSink(this);
         EvtBridge.attach(this);
@@ -49,6 +52,7 @@ public class MainActivity extends Activity implements LogBus.Sink {
     @Override protected void onResume() {
         super.onResume();
         refreshPerm();
+        renderSummary();
         if (logView != null) logView.setText(LogBus.dump().length() == 0 ? "（暂无输出）" : LogBus.dump());
     }
 
@@ -131,7 +135,10 @@ public class MainActivity extends Activity implements LogBus.Sink {
         row3.addView(btn("打开 Google One", CARD, TXT, new View.OnClickListener() {
             public void onClick(View v) { openGoogleOne(); }
         }));
-        row3.addView(btn("取订阅 token", ACCENT, Color.WHITE, new View.OnClickListener() {
+        row3.addView(btn("能拿什么", ACCENT, Color.WHITE, new View.OnClickListener() {
+            public void onClick(View v) { LogBus.summary(MainActivity.this); }
+        }));
+        row3.addView(btn("取订阅 token", CARD, GREEN, new View.OnClickListener() {
             public void onClick(View v) { LogBus.fetchToken(MainActivity.this); }
         }));
         row3.addView(btn("打开 LSPosed", CARD, TXT, new View.OnClickListener() {
@@ -159,6 +166,32 @@ public class MainActivity extends Activity implements LogBus.Sink {
         steps.setLineSpacing(dp(4), 1f);
         steps.setPadding(dp(4), dp(14), dp(4), dp(10));
         root.addView(steps);
+
+        // 能拿什么（查询后自动填）
+        TextView sTitle = new TextView(this);
+        sTitle.setText("这个账号能白拿什么");
+        sTitle.setTextColor(TXT);
+        sTitle.setTextSize(13);
+        sTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        sTitle.setPadding(dp(2), dp(4), 0, dp(8));
+        root.addView(sTitle);
+
+        summaryBox = new LinearLayout(this);
+        summaryBox.setOrientation(LinearLayout.VERTICAL);
+        root.addView(summaryBox, lp(dp(0), 0, dp(0), dp(6)));
+
+        LinearLayout sRow = new LinearLayout(this);
+        sRow.setOrientation(LinearLayout.HORIZONTAL);
+        sRow.addView(btn("扫描并汇总", GREEN, Color.BLACK, new View.OnClickListener() {
+            public void onClick(View v) {
+                LogBus.send(MainActivity.this, "query", null, null, false, null);
+                LogBus.append("开始扫描 143 个候选商品…");
+            }
+        }));
+        sRow.addView(btn("重新汇总", CARD, TXT, new View.OnClickListener() {
+            public void onClick(View v) { LogBus.summary(MainActivity.this); }
+        }));
+        root.addView(sRow, lp(dp(0), 0, dp(0), dp(16)));
 
         // 方案列表
         TextView pTitle = new TextView(this);
@@ -221,6 +254,88 @@ public class MainActivity extends Activity implements LogBus.Sink {
         }), lp(dp(0), dp(8), dp(0), dp(20)));
 
         setContentView(page);
+    }
+
+    /** 把存下来的汇总渲染成卡片，按档位分组，点一行直接开 */
+    private void renderSummary() {
+        if (summaryBox == null) return;
+        summaryBox.removeAllViews();
+        final java.util.List<SummaryStore.Row> rows = SummaryStore.load(this);
+        if (rows.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("还没扫描。点「扫描并汇总」看看这个账号能拿到哪些免费订阅。");
+            empty.setTextColor(DIM);
+            empty.setTextSize(11);
+            empty.setPadding(dp(4), dp(4), dp(4), dp(4));
+            summaryBox.addView(empty);
+            return;
+        }
+
+        String curTier = null;
+        for (final SummaryStore.Row r : rows) {
+            if (!r.tier.equals(curTier)) {
+                curTier = r.tier;
+                TextView h = new TextView(this);
+                h.setText("【" + curTier + "】");
+                h.setTextColor(ACCENT);
+                h.setTextSize(12);
+                h.setTypeface(Typeface.DEFAULT_BOLD);
+                h.setPadding(dp(4), dp(10), dp(4), dp(5));
+                summaryBox.addView(h);
+            }
+            LinearLayout card = new LinearLayout(this);
+            card.setOrientation(LinearLayout.HORIZONTAL);
+            card.setBackground(round(CARD, 10));
+            card.setPadding(dp(12), dp(10), dp(12), dp(10));
+            card.setGravity(Gravity.CENTER_VERTICAL);
+
+            TextView m = new TextView(this);
+            m.setText(r.months > 0 ? r.months + " 个月" : "免费");
+            m.setTextColor(GREEN);
+            m.setTextSize(13);
+            m.setTypeface(Typeface.DEFAULT_BOLD);
+            m.setMinWidth(dp(56));
+            card.addView(m);
+
+            LinearLayout mid = new LinearLayout(this);
+            mid.setOrientation(LinearLayout.VERTICAL);
+            LinearLayout.LayoutParams mp = new LinearLayout.LayoutParams(0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            card.addView(mid, mp);
+
+            TextView sku = new TextView(this);
+            sku.setText(shortSku(r.sku));
+            sku.setTextColor(TXT);
+            sku.setTextSize(11);
+            mid.addView(sku);
+
+            TextView off = new TextView(this);
+            off.setText(r.offer == null || r.offer.equals("null") ? "基础档" : r.offer);
+            off.setTextColor(DIM);
+            off.setTextSize(9);
+            mid.addView(off);
+
+            TextView go = new TextView(this);
+            go.setText("开这个");
+            go.setTextColor(ACCENT);
+            go.setTextSize(11);
+            go.setPadding(dp(10), dp(4), dp(4), dp(4));
+            card.addView(go);
+
+            card.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    LogBus.open(MainActivity.this, r.sku, r.offer);
+                    LogBus.append("→ " + r.sku + " [" + r.offer + "]");
+                }
+            });
+            summaryBox.addView(card, lp(dp(0), 0, dp(0), dp(5)));
+        }
+    }
+
+    private String shortSku(String s) {
+        if (s == null) return "?";
+        if (s.startsWith("g1.")) s = s.substring(3);
+        return s;
     }
 
     private LinearLayout.LayoutParams lp(int l, int t, int r, int bo) {

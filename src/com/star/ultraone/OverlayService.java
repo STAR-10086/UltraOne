@@ -181,6 +181,9 @@ public class OverlayService extends Service implements LogBus.Sink {
                 setStatus("已请求扫描全部 SKU…");
             }
         }));
+        row0.addView(btn("能拿什么", GREEN, Color.BLACK, new View.OnClickListener() {
+            public void onClick(View v) { LogBus.summary(OverlayService.this); }
+        }));
         row0.addView(btn("取 token", CARD, GREEN, new View.OnClickListener() {
             public void onClick(View v) { LogBus.fetchToken(OverlayService.this); }
         }));

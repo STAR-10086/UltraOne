@@ -49,7 +49,7 @@ public class Main implements IXposedHookLoadPackage {
     public static final String MOD = "com.star.ultraone";
     public static final String CMD = "com.star.ultraone.CMD";
     public static final String EVT = "com.star.ultraone.EVT";
-    public static final String VERSION = "3.1";
+    public static final String VERSION = "3.2";
 
     static Context ctx;
     static ClassLoader billing;
@@ -63,6 +63,11 @@ public class Main implements IXposedHookLoadPackage {
     static final HashMap<String, String> tkMap = new HashMap<String, String>();
     static final HashMap<String, String> offerMap = new HashMap<String, String>();
     static final HashMap<String, String> labelMap = new HashMap<String, String>();
+    static final HashMap<String, Boolean> freeMap = new HashMap<String, Boolean>();
+    static final HashMap<String, String> periodMap = new HashMap<String, String>();
+    static final HashMap<String, String> tierMap = new HashMap<String, String>();
+    static volatile int pendingBatches;
+    static volatile boolean summaryScheduled;
 
     static Object keepRef;
     static String lastSku = "g1.2tb.ai.subs_variant";
@@ -107,51 +112,188 @@ public class Main implements IXposedHookLoadPackage {
     static volatile long harvestedAt;
     static volatile String harvestedDoc;
 
-    static void hookAppBilling(ClassLoader appCl) {
-        // app 用的 Billing 库版本自己带，类名固定
+    /** 探测：把 classloader 结构、billing 类真名、模块 apk 路径都打出来 */
+    static void probe(ClassLoader appCl) {
+        emit("═══ 探测开始 ═══");
         try {
-            Class<?> builder = XposedHelpers.findClass("com.android.billingclient.api.BillingClient$Builder", appCl);
-            XposedHelpers.findAndHookMethod(builder, "setListener",
-                    XposedHelpers.findClass("com.android.billingclient.api.PurchasesUpdatedListener", appCl),
-                    new XC_MethodHook() {
-                        @Override protected void beforeHookedMethod(MethodHookParam p) {
-                            try {
-                                Object w = wrapListener(p.args[0], "onPurchasesUpdated");
-                                if (w != null) p.args[0] = w;
-                            } catch (Throwable ignored) { }
-                        }
-                    });
-            log("hooked setListener");
-        } catch (Throwable t) { log("hook setListener: " + t); }
+            ClassLoader ml = Main.class.getClassLoader();
+            emit("module CL = " + (ml == null ? "null" : ml.getClass().getName()));
+            emit("app CL    = " + appCl.getClass().getName());
+            dumpLoader("module", ml);
+            dumpLoader("app", appCl);
+        } catch (Throwable t) { emit("probe loader err " + t); }
 
+        // 在 app 的 dex 里搜 billing / Purchase 相关类名
         try {
-            Class<?> impl = XposedHelpers.findClass("com.android.billingclient.api.BillingClientImpl", appCl);
-            for (final Method m : impl.getDeclaredMethods()) {
-                if (!m.getName().equals("queryPurchasesAsync")) continue;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
-                    @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        try {
-                            for (int i = 0; i < p.args.length; i++) {
-                                Object w = wrapListener(p.args[i], "onQueryPurchasesResponse");
-                                if (w != null) p.args[i] = w;
-                            }
-                        } catch (Throwable ignored) { }
-                    }
-                });
+            java.util.TreeSet<String> hits = new java.util.TreeSet<String>();
+            for (String cn : listClasses(appCl)) {
+                String low = cn.toLowerCase();
+                if (low.contains("billingclient") || low.endsWith(".purchase")
+                        || low.contains("purchaselistener") || low.contains("productdetails")) {
+                    hits.add(cn);
+                }
             }
-            log("hooked queryPurchasesAsync");
-        } catch (Throwable t) { log("hook queryPurchasesAsync: " + t); }
+            emit("billing 相关类共 " + hits.size() + " 个：");
+            int n = 0;
+            for (String s : hits) {
+                if (n++ > 40) { emit("  …"); break; }
+                emit("  " + s);
+            }
+        } catch (Throwable t) { emit("probe classes err " + t); }
 
-        // 兜底：直接盯 Purchase.getPurchaseToken，app 任何时候读到都会漏出来
+        // 对 Purchase 类 dump 方法名
         try {
-            Class<?> purchase = XposedHelpers.findClass("com.android.billingclient.api.Purchase", appCl);
-            XposedHelpers.findAndHookMethod(purchase, "getPurchaseToken", new XC_MethodHook() {
+            Class<?> pc = null;
+            for (String cn : listClasses(appCl)) {
+                if (cn.endsWith("Purchase") && cn.toLowerCase().contains("billing")) { pc = Class.forName(cn, false, appCl); break; }
+            }
+            if (pc != null) {
+                emit("Purchase 类 = " + pc.getName());
+                for (Method m : pc.getDeclaredMethods()) {
+                    emit("   M " + m.getReturnType().getSimpleName() + " " + m.getName()
+                            + "(" + m.getParameterCount() + ")");
+                }
+                for (Field f : pc.getDeclaredFields()) {
+                    emit("   F " + f.getType().getSimpleName() + " " + f.getName());
+                }
+                // 构造器签名
+                for (java.lang.reflect.Constructor<?> co : pc.getDeclaredConstructors()) {
+                    emit("   C (" + co.getParameterCount() + ")");
+                }
+            } else emit("没找到 Purchase 类");
+        } catch (Throwable t) { emit("probe purchase err " + t); }
+        emit("═══ 探测结束 ═══");
+    }
+
+    static void dumpLoader(String tag, ClassLoader cl) {
+        if (cl == null) { emit(tag + " = null"); return; }
+        Class<?> c = cl.getClass();
+        while (c != null && !c.getName().equals("dalvik.system.BaseDexClassLoader")) c = c.getSuperclass();
+        if (c == null) { emit(tag + " 不是 BaseDexClassLoader（父链：" + chain(cl.getClass()) + "）"); return; }
+        try {
+            Field f = c.getDeclaredField("pathList");
+            f.setAccessible(true);
+            Object pl = f.get(cl);
+            Field fe = pl.getClass().getDeclaredField("dexElements");
+            fe.setAccessible(true);
+            Object[] els = (Object[]) fe.get(pl);
+            emit(tag + " dexElements = " + els.length);
+            for (Object e : els) {
+                try {
+                    Field ff = e.getClass().getDeclaredField("path");
+                    ff.setAccessible(true);
+                    emit("   path = " + ff.get(e));
+                } catch (Throwable t) { emit("   path? " + t); }
+            }
+        } catch (Throwable t) { emit(tag + " dump err " + t); }
+    }
+
+    static String chain(Class<?> c) {
+        StringBuilder sb = new StringBuilder();
+        while (c != null) { sb.append(c.getName()).append(" < "); c = c.getSuperclass(); }
+        return sb.toString();
+    }
+
+    /** 列出 classloader 里所有类名 */
+    static java.util.List<String> listClasses(ClassLoader cl) {
+        java.util.List<String> out = new java.util.ArrayList<String>();
+        Class<?> c = cl.getClass();
+        while (c != null && !c.getName().equals("dalvik.system.BaseDexClassLoader")) c = c.getSuperclass();
+        if (c == null) return out;
+        try {
+            Field f = c.getDeclaredField("pathList");
+            f.setAccessible(true);
+            Object pl = f.get(cl);
+            Field fe = pl.getClass().getDeclaredField("dexElements");
+            fe.setAccessible(true);
+            Object[] els = (Object[]) fe.get(pl);
+            for (Object e : els) {
+                try {
+                    Field df = e.getClass().getDeclaredField("dexFile");
+                    df.setAccessible(true);
+                    Object dex = df.get(e);
+                    if (dex == null) continue;
+                    Method entries = dex.getClass().getMethod("entries");
+                    java.util.Enumeration<String> en = (java.util.Enumeration<String>) entries.invoke(dex);
+                    while (en.hasMoreElements()) out.add(en.nextElement());
+                } catch (Throwable ignored) { }
+            }
+        } catch (Throwable ignored) { }
+        return out;
+    }
+
+    /**
+     * Google One 把 Billing 库做了 R8 混淆：只保留了 Purchase / SkuDetails /
+     * ProxyBillingActivity 三个类名，方法名全变成 a()、b()，字段变成 a/b/c/d。
+     * 所以不能按 getPurchaseToken 找，改 hook Purchase 的构造器——
+     * 任何 Purchase 对象创建都必经这里，构造器第一个参数就是 Play 返回的 JSON。
+     */
+    static void hookAppBilling(ClassLoader appCl) {
+        try {
+            final Class<?> purchase = Class.forName("com.android.billingclient.api.Purchase", false, appCl);
+            emit("Purchase 构造器数 = " + purchase.getDeclaredConstructors().length);
+            XposedBridge.hookAllConstructors(purchase, new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
-                    Object v = p.getResult();
-                    if (v instanceof String && ((String) v).length() >= 40) record((String) v, null);
+                    try {
+                        harvestPurchase(p.thisObject);
+                    } catch (Throwable t) { log("harvest ctor: " + t); }
                 }
             });
-        } catch (Throwable t) { log("hook getPurchaseToken: " + t); }
+            // 顺便 hook 它那个唯一的实例方法 a()，app 每次取 sku 列表也会经过
+            for (Method m : purchase.getDeclaredMethods()) {
+                if (m.getParameterCount() != 0) continue;
+                if (!(m.getReturnType() == java.util.ArrayList.class
+                        || m.getReturnType() == List.class)) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam p) {
+                        try { harvestPurchase(p.thisObject); } catch (Throwable ignored) { }
+                    }
+                });
+                emit("已 hook Purchase." + m.getName() + "()");
+            }
+            emit("已 hook Purchase 构造器");
+        } catch (Throwable t) { log("hook Purchase: " + t); }
+    }
+
+    /** 从 Purchase 实例里把 token 挖出来（字段被混淆，按类型找 JSONObject） */
+    static void harvestPurchase(Object purchase) {
+        if (purchase == null) return;
+        org.json.JSONObject json = null;
+        try {
+            for (Field f : purchase.getClass().getDeclaredFields()) {
+                if (f.getType() == org.json.JSONObject.class) {
+                    f.setAccessible(true);
+                    Object v = f.get(purchase);
+                    if (v instanceof org.json.JSONObject) { json = (org.json.JSONObject) v; break; }
+                }
+            }
+        } catch (Throwable ignored) { }
+        if (json == null) {
+            // 退一步：读 String 字段当原始 JSON 解析
+            try {
+                for (Field f : purchase.getClass().getDeclaredFields()) {
+                    if (f.getType() != String.class) continue;
+                    f.setAccessible(true);
+                    Object v = f.get(purchase);
+                    if (v instanceof String && ((String) v).startsWith("{")) {
+                        json = new org.json.JSONObject((String) v);
+                        break;
+                    }
+                }
+            } catch (Throwable ignored) { }
+        }
+        if (json == null) return;
+
+        String token = json.optString("purchaseToken", null);
+        if (token == null || token.length() < 40) return;
+        String orderId = json.optString("orderId", null);
+        String doc = null;
+        try {
+            org.json.JSONArray arr = json.optJSONArray("productIds");
+            if (arr != null && arr.length() > 0) doc = arr.getString(0);
+            else doc = json.optString("productId", null);
+        } catch (Throwable ignored) { }
+        record(token, doc == null ? orderId : doc);
     }
 
     /** 把 listener 包一层：先收割参数里的 Purchase，再原样转发 */
@@ -227,6 +369,8 @@ public class Main implements IXposedHookLoadPackage {
                     else if ("preset".equals(cmd)) runPreset(i.getStringExtra("preset"), token);
                     else if ("sub".equals(cmd)) subscribe(i.getStringExtra("sku"), i.getStringExtra("offer"), i.getBooleanExtra("upgrade", false), token);
                     else if ("state".equals(cmd)) state();
+                    else if ("probe".equals(cmd)) probe(Main.class.getClassLoader());
+                    else if ("summary".equals(cmd)) printSummary();
                 }
             };
             IntentFilter f = new IntentFilter(CMD);
@@ -257,8 +401,19 @@ public class Main implements IXposedHookLoadPackage {
 
     // ───────────────────────── dex 加载 ─────────────────────────
 
-    /** 从 LSPosed 注入的模块 ClassLoader 里找出模块 apk 路径（不依赖包可见性） */
+    /** 找模块 apk 路径：PackageManager 优先，其次 dexElements，最后 ActivityThread */
     static String moduleApk() {
+        // ① PackageManager（最稳；LSPosed 加载的模块 classloader 常常是内存 dex，没有 path）
+        try {
+            android.content.pm.ApplicationInfo ai =
+                    ctx.getPackageManager().getApplicationInfo(MOD, 0);
+            if (ai != null && ai.sourceDir != null && new File(ai.sourceDir).exists()) {
+                log("moduleApk via PackageManager: " + ai.sourceDir);
+                return ai.sourceDir;
+            }
+        } catch (Throwable t) { log("moduleApk pm: " + t); }
+
+        // ② dexElements 里的 path
         try {
             ClassLoader cl = Main.class.getClassLoader();
             Field f = dalvik.system.BaseDexClassLoader.class.getDeclaredField("pathList");
@@ -280,10 +435,29 @@ public class Main implements IXposedHookLoadPackage {
                     Field ff = e.getClass().getDeclaredField("path");
                     ff.setAccessible(true);
                     String p = (String) ff.get(e);
-                    if (p != null && p.endsWith(".apk")) return p;
+                    if (p != null && p.endsWith(".apk")) {
+                        log("moduleApk via dexElements: " + p);
+                        return p;
+                    }
                 } catch (Throwable ignored) { }
             }
-        } catch (Throwable t) { log("moduleApk err " + t); }
+        } catch (Throwable t) { log("moduleApk dexElements: " + t); }
+
+        // ③ 从 /data/app 目录里按包名扫（root 才可能读，但 LSPosed 进程通常能读自己）
+        try {
+            File base = new File("/data/app");
+            File[] dirs = base.listFiles();
+            if (dirs != null) {
+                for (File d : dirs) {
+                    if (!d.getName().startsWith(MOD + "-")) continue;
+                    File apk = new File(d, "base.apk");
+                    if (apk.exists()) {
+                        log("moduleApk via /data/app: " + apk);
+                        return apk.getAbsolutePath();
+                    }
+                }
+            }
+        } catch (Throwable t) { log("moduleApk dataapp: " + t); }
         return null;
     }
 
@@ -380,11 +554,16 @@ public class Main implements IXposedHookLoadPackage {
             if (!ready) { connect(); emit("计费服务未就绪，已发起重连"); return; }
             List<Skus.Item> all = Skus.CATALOG;
             int batch = 20;
+            int n = (all.size() + batch - 1) / batch;
+            pendingBatches = n;
+            summaryScheduled = false;
+            pdMap.clear(); tkMap.clear(); offerMap.clear();
+            labelMap.clear(); freeMap.clear(); periodMap.clear(); tierMap.clear();
+            emit("扫描 " + all.size() + " 个候选商品（" + n + " 批），结果会自动汇总…");
             for (int i = 0; i < all.size(); i += batch) {
                 int end = Math.min(i + batch, all.size());
                 queryBatch(new ArrayList<Skus.Item>(all.subList(i, end)));
             }
-            emit("已提交 " + all.size() + " 个商品查询（" + ((all.size() + batch - 1) / batch) + " 批）");
         } catch (Throwable t) { emit("查询异常 " + t); }
     }
 
@@ -419,6 +598,7 @@ public class Main implements IXposedHookLoadPackage {
     static String tier(String pid) {
         int pm = Skus.months(pid);
         String tag = pm > 0 ? " · SKU 自带 " + pm + " 个月免费" : "";
+        if (pid.contains("helium")) return "Google AI Pro 5TB" + tag;
         if (pid.contains("2tb.ai") || pid.contains("gemini.2tb")) return "Google AI Pro 5TB" + tag;
         if (pid.contains("2tb")) return "Google One 2TB" + tag;
         if (pid.contains("100gb")) return "Google One 100GB" + tag;
@@ -474,12 +654,57 @@ public class Main implements IXposedHookLoadPackage {
                     tkMap.put(key, (String) r[4]);
                     offerMap.put(key, oid);
                     labelMap.put(key, periodText((String) r[3]));
+                    freeMap.put(key, free);
+                    periodMap.put(key, (String) r[3]);
+                    tierMap.put(pid, tier(pid));
                     emit("   " + (free ? "★ " : "  ") + (oid.equals("null") ? "基础档" : oid)
                             + "   " + r[2] + " · 首期 " + periodText((String) r[3])
                             + (free ? "   [免费]" : ""));
                 }
             }
         } catch (Throwable t) { emit("解析失败 " + t); }
+        finally { batchDone(); }
+    }
+
+    /** 每批回来减一，全部回来时自动打印汇总 */
+    static void batchDone() {
+        int left = pendingBatches - 1;
+        pendingBatches = left;
+        if (left > 0 || summaryScheduled) return;
+        summaryScheduled = true;
+        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+            public void run() { summaryScheduled = false; printSummary(); }
+        }, 1200);
+    }
+
+    /** 汇总：告诉用户这个账号能白拿什么 */
+    static void printSummary() {
+        if (freeMap.isEmpty() && pdMap.isEmpty()) {
+            emit("还没有查询结果，先点「查询全部 offer」");
+            return;
+        }
+        for (String line : Summary.report(freeMap, tierMap, periodMap)) emit(line);
+        emitRows();
+    }
+
+    /** 把结构化汇总以广播送出，模块进程存盘后界面就能渲染卡片 */
+    static void emitRows() {
+        try {
+            List<Summary.Row> rows = Summary.rows(freeMap, tierMap, periodMap);
+            org.json.JSONArray arr = new org.json.JSONArray();
+            for (Summary.Row r : rows) {
+                org.json.JSONObject o = new org.json.JSONObject();
+                o.put("tier", r.tier);
+                o.put("sku", r.sku);
+                o.put("offer", r.offer);
+                o.put("months", r.months);
+                arr.put(o);
+            }
+            Intent i = new Intent(EVT);
+            i.setPackage(MOD);
+            i.putExtra("rows", arr.toString());
+            ctx.sendBroadcast(i);
+        } catch (Throwable t) { log("emitRows " + t); }
     }
 
     static String periodText(String p) {
