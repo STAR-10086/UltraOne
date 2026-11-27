@@ -110,13 +110,28 @@ SKU 是否对当前账号/区域开放由 Play 服务端决定，查不到就是
 
 叠加用的是 `setReplaceProrationMode(5)`，实测语义是 **DEFERRED** —— Play 把旧订阅剩余时间折算顺延，不是立即换档补差价，所以每段都是 $0.00。
 
-**每次叠加前必须换 token**：叠加后 `purchaseToken` 会变。模块会自己取：
+### 3.4 叠加时的 token 怎么来（全程手机，不需要电脑）
 
-1. `su` 读 `/data/data/com.android.vending/databases/library.db` 的 `ownership.inapp_purchase_data`，解析出 token
-2. 拿不到就退回 `queryPurchasesAsync(subs)` → `queryPurchaseHistoryAsync`
-3. 全拿不到就按普通开通处理（会在日志里说明）
+叠加后 `purchaseToken` 会变，用旧 token Play 会报「我们这边出了点问题」。**v3.1 起模块自己解决，不用再插电脑跑脚本。**
 
-所以**叠加需要 root**（Magisk / KernelSU 授权 UltraOne 的 su）。只有"首次开档"的话不需要 root。
+三级回退，按顺序自动试：
+
+| 顺序 | 来源 | 需要 root | 说明 |
+|---|---|---|---|
+| ① | **app 回调捕获** | 否 | hook Google One 自己的 `PurchasesUpdatedListener` / `queryPurchasesAsync` / `Purchase.getPurchaseToken`，它每次进「管理方案」页都会查订阅，回调里的 `Purchase` 就带 token。购买完成后 Play 也会回调，所以叠加完自动就有新 token。 |
+| ② | **模块进程 su 读库** | 是 | UltraOne 自己 `su` 把 Play 的 `library.db`（连同 `-wal` / `-shm`）拷进私有目录再解析 `ownership.inapp_purchase_data`。SELinux 不让写时退回 `su cat` 走 stdout 搬字节。 |
+| ③ | Google One 进程内查询 | 视情况 | `queryPurchasesAsync(subs)` → `queryPurchaseHistoryAsync`，在注入的 BillingClient 里常常返回空，所以只当兜底。 |
+
+**①② 都不需要电脑。** 只要把 app 回调那条路走通，纯无 root 也能叠加：
+
+1. 打开 Google One → 头像 → **管理方案**，让 app 自己查一次订阅
+2. 回到悬浮窗点 **「取 token」**，日志会打印 `已捕获现有订阅 token（165 字符 · g1.2tb.ai.subs_variant）`
+3. 点「② 叠加 +6 个月」
+
+> 没捕获到时日志会提示「进 Google One 的『管理方案』页逛一下就会自动捕获」。
+> 捕获到之后，点叠加按钮会**直接用这个 token**，不用再点「取 token」。
+
+模块还保留了两个旧路径做兼容：`/data/local/tmp/ultra_token.txt` 预置文件、以及注入进程里的 su 读库（旧版行为）。
 
 ---
 
@@ -134,8 +149,9 @@ src/com/star/ultraone/
   Skus.java                      SKU 目录 + 一键方案表
   OverlayService.java            悬浮窗（前台服务）
   MainActivity.java              应用主界面（权限引导 + 同一套按钮 + 日志）
-  LogBus.java                    进程内日志总线 + 命令发送
-  CmdReceiver.java               接收 Google One 回传的 EVT
+  LogBus.java                    进程内日志总线 + 命令发送 + 方案预取 token
+  TokenVault.java                模块进程内 su 读 Play 库取 token（root 路径）
+  EvtBridge.java                 动态注册 EVT 广播，收 Google One 回传
 build.sh                         一键构建（javac → d8 → aapt2 → zipalign → apksigner）
 ```
 
@@ -173,7 +189,7 @@ bash build.sh
 | 「计费服务 连接失败 code=3」 | Play 商店没登录 / 被冻结；打开 Play 商店确认账号可用 |
 | 查询全空 | 该账号/区域没有这些隐藏 SKU；换账号或换节点 |
 | 拉起收银台报「购买交易未完成」 | Play 侧已下架该 offer，换下一个方案 |
-| 叠加时提示读不到 token | 没给 su 权限 → Magisk/KernelSU 里授权 UltraOne |
+| 叠加时提示读不到 token | 先去 Google One「管理方案」页逛一圈让 app 查订阅；还不行再给 su 权限走 root 路径 |
 
 日志同时在：悬浮窗、应用内、`logcat -s UltraOne`、LSPosed 日志。
 

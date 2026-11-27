@@ -181,8 +181,8 @@ public class OverlayService extends Service implements LogBus.Sink {
                 setStatus("已请求扫描全部 SKU…");
             }
         }));
-        row0.addView(btn("连接状态", CARD, TXT, new View.OnClickListener() {
-            public void onClick(View v) { LogBus.send(OverlayService.this, "state", null, null, false, null); }
+        row0.addView(btn("取 token", CARD, GREEN, new View.OnClickListener() {
+            public void onClick(View v) { LogBus.fetchToken(OverlayService.this); }
         }));
         row0.addView(btn("清空", CARD, DIM, new View.OnClickListener() {
             public void onClick(View v) { LogBus.clear(); out.setText(""); }
@@ -205,7 +205,7 @@ public class OverlayService extends Service implements LogBus.Sink {
             b.setBackground(round(p.steps.get(0).upgrade ? 0xFF2E7D5B : CARD, 10));
             b.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) {
-                    LogBus.send(OverlayService.this, "preset", null, null, false, p.id);
+                    LogBus.runPreset(OverlayService.this, p.id);
                     setStatus("已请求：" + p.title);
                 }
             });

@@ -131,6 +131,9 @@ public class MainActivity extends Activity implements LogBus.Sink {
         row3.addView(btn("打开 Google One", CARD, TXT, new View.OnClickListener() {
             public void onClick(View v) { openGoogleOne(); }
         }));
+        row3.addView(btn("取订阅 token", ACCENT, Color.WHITE, new View.OnClickListener() {
+            public void onClick(View v) { LogBus.fetchToken(MainActivity.this); }
+        }));
         row3.addView(btn("打开 LSPosed", CARD, TXT, new View.OnClickListener() {
             public void onClick(View v) {
                 Intent i = getPackageManager().getLaunchIntentForPackage("org.lsposed.manager");
@@ -173,7 +176,7 @@ public class MainActivity extends Activity implements LogBus.Sink {
             item.setPadding(dp(14), dp(11), dp(14), dp(11));
             item.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) {
-                    LogBus.send(MainActivity.this, "preset", null, null, false, p.id);
+                    LogBus.runPreset(MainActivity.this, p.id);
                     LogBus.append("→ " + p.title);
                 }
             });

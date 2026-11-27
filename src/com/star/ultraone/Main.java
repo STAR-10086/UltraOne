@@ -49,7 +49,7 @@ public class Main implements IXposedHookLoadPackage {
     public static final String MOD = "com.star.ultraone";
     public static final String CMD = "com.star.ultraone.CMD";
     public static final String EVT = "com.star.ultraone.EVT";
-    public static final String VERSION = "3.0";
+    public static final String VERSION = "3.1";
 
     static Context ctx;
     static ClassLoader billing;
@@ -81,6 +81,7 @@ public class Main implements IXposedHookLoadPackage {
                         if (c == null) return;
                         ctx = c;
                         listen();
+                        hookAppBilling(c.getClassLoader());
                         new Thread(new Runnable() {
                             public void run() { connect(); }
                         }, "ultraone-connect").start();
@@ -93,6 +94,125 @@ public class Main implements IXposedHookLoadPackage {
         } catch (Throwable t) { log("hook err " + Log.getStackTraceString(t)); }
     }
 
+    // ─────────────────── 从 app 自己的 Billing 回调里捡 token ───────────────────
+    //
+    // 叠加续期最麻烦的是"拿当前订阅的 purchaseToken"。
+    // 之前靠电脑 adb 读 Play 的 library.db 再 push 文件，这里改成两条路都自己走：
+    //   1) hook app 自己的 BillingClient 回调（onPurchasesUpdated / onQueryPurchasesResponse）
+    //      —— app 每次进 Google One 都会查订阅，回调里的 Purchase 就带 token，零 root
+    //   2) 拿不到才退回 su 读库（见 TokenVault，在模块进程里做）
+    // 购买完成后 Play 也会回调 onPurchasesUpdated，所以叠加完自动就有新 token。
+
+    static volatile String harvested;
+    static volatile long harvestedAt;
+    static volatile String harvestedDoc;
+
+    static void hookAppBilling(ClassLoader appCl) {
+        // app 用的 Billing 库版本自己带，类名固定
+        try {
+            Class<?> builder = XposedHelpers.findClass("com.android.billingclient.api.BillingClient$Builder", appCl);
+            XposedHelpers.findAndHookMethod(builder, "setListener",
+                    XposedHelpers.findClass("com.android.billingclient.api.PurchasesUpdatedListener", appCl),
+                    new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam p) {
+                            try {
+                                Object w = wrapListener(p.args[0], "onPurchasesUpdated");
+                                if (w != null) p.args[0] = w;
+                            } catch (Throwable ignored) { }
+                        }
+                    });
+            log("hooked setListener");
+        } catch (Throwable t) { log("hook setListener: " + t); }
+
+        try {
+            Class<?> impl = XposedHelpers.findClass("com.android.billingclient.api.BillingClientImpl", appCl);
+            for (final Method m : impl.getDeclaredMethods()) {
+                if (!m.getName().equals("queryPurchasesAsync")) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        try {
+                            for (int i = 0; i < p.args.length; i++) {
+                                Object w = wrapListener(p.args[i], "onQueryPurchasesResponse");
+                                if (w != null) p.args[i] = w;
+                            }
+                        } catch (Throwable ignored) { }
+                    }
+                });
+            }
+            log("hooked queryPurchasesAsync");
+        } catch (Throwable t) { log("hook queryPurchasesAsync: " + t); }
+
+        // 兜底：直接盯 Purchase.getPurchaseToken，app 任何时候读到都会漏出来
+        try {
+            Class<?> purchase = XposedHelpers.findClass("com.android.billingclient.api.Purchase", appCl);
+            XposedHelpers.findAndHookMethod(purchase, "getPurchaseToken", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam p) {
+                    Object v = p.getResult();
+                    if (v instanceof String && ((String) v).length() >= 40) record((String) v, null);
+                }
+            });
+        } catch (Throwable t) { log("hook getPurchaseToken: " + t); }
+    }
+
+    /** 把 listener 包一层：先收割参数里的 Purchase，再原样转发 */
+    static Object wrapListener(Object original, final String targetMethod) {
+        if (original == null || !original.getClass().isInterface()
+                && original.getClass().getInterfaces().length == 0) return null;
+        Class<?>[] ifs = original.getClass().getInterfaces();
+        if (ifs == null || ifs.length == 0) return null;
+        for (Class<?> i : ifs) {
+            if (!i.getName().contains("Listener")) return null;
+        }
+        final Object orig = original;
+        try {
+            return Proxy.newProxyInstance(original.getClass().getClassLoader(), ifs,
+                    new InvocationHandler() {
+                        public Object invoke(Object p, Method m, Object[] a) throws Throwable {
+                            if (targetMethod.equals(m.getName())) harvest(a);
+                            try {
+                                return m.invoke(orig, a);
+                            } catch (java.lang.reflect.InvocationTargetException e) {
+                                throw e.getCause() == null ? e : e.getCause();
+                            }
+                        }
+                    });
+        } catch (Throwable t) { return null; }
+    }
+
+    /** 从回调参数里把 List<Purchase> 的 token 抠出来 */
+    static void harvest(Object[] args) {
+        if (args == null) return;
+        for (Object a : args) {
+            if (!(a instanceof List)) continue;
+            for (Object o : (List<?>) a) {
+                if (o == null) continue;
+                try {
+                    Object t = o.getClass().getMethod("getPurchaseToken").invoke(o);
+                    if (t instanceof String && ((String) t).length() >= 40) {
+                        String doc = null;
+                        try {
+                            Object pids = o.getClass().getMethod("getProducts").invoke(o);
+                            if (pids instanceof List && !((List<?>) pids).isEmpty()) {
+                                doc = String.valueOf(((List<?>) pids).get(0));
+                            }
+                        } catch (Throwable ignored) { }
+                        record((String) t, doc);
+                    }
+                } catch (Throwable ignored) { }
+            }
+        }
+    }
+
+    static void record(String token, String doc) {
+        if (token == null || token.length() < 40) return;
+        if (token.equals(harvested)) return;
+        harvested = token;
+        harvestedAt = System.currentTimeMillis();
+        harvestedDoc = doc;
+        emit("捕获到现有订阅 token（" + token.length() + " 字符"
+                + (doc == null ? "" : " · " + doc) + "）");
+    }
+
     // ───────────────────────── 命令通道 ─────────────────────────
 
     static void listen() {
@@ -102,9 +222,10 @@ public class Main implements IXposedHookLoadPackage {
                 @Override public void onReceive(Context c, Intent i) {
                     String cmd = i.getStringExtra("cmd");
                     log("cmd=" + cmd);
+                    String token = i.getStringExtra("token");
                     if ("query".equals(cmd)) queryAll();
-                    else if ("preset".equals(cmd)) runPreset(i.getStringExtra("preset"));
-                    else if ("sub".equals(cmd)) subscribe(i.getStringExtra("sku"), i.getStringExtra("offer"), i.getBooleanExtra("upgrade", false));
+                    else if ("preset".equals(cmd)) runPreset(i.getStringExtra("preset"), token);
+                    else if ("sub".equals(cmd)) subscribe(i.getStringExtra("sku"), i.getStringExtra("offer"), i.getBooleanExtra("upgrade", false), token);
                     else if ("state".equals(cmd)) state();
                 }
             };
@@ -122,6 +243,14 @@ public class Main implements IXposedHookLoadPackage {
     static void state() {
         emit("状态：计费服务 " + (ready ? "已连接" : (connecting ? "连接中" : "未连接"))
                 + " · 已缓存 " + pdMap.size() + " 个 offer");
+        String h = harvested;
+        if (h != null) {
+            emit("已捕获现有订阅 token（" + h.length() + " 字符"
+                    + (harvestedDoc == null ? "" : " · " + harvestedDoc) + "）"
+                    + " · " + ((System.currentTimeMillis() - harvestedAt) / 1000) + " 秒前");
+        } else {
+            emit("还没捕获到订阅 token · 进 Google One 的「管理方案」页逛一下就会自动捕获");
+        }
         if (ready) emit("就绪，可以查询或直接开档");
         else { emit("正在重连…"); connect(); }
     }
@@ -364,15 +493,15 @@ public class Main implements IXposedHookLoadPackage {
 
     // ───────────────────────── 开档 ─────────────────────────
 
-    static void runPreset(String presetId) {
+    static void runPreset(String presetId, String presetToken) {
         Skus.Preset p = Skus.preset(presetId);
         if (p == null) { emit("未知方案 " + presetId); return; }
         emit("▶ " + p.title);
         Skus.Step s = p.steps.get(0);
-        subscribe(s.sku, s.offer, s.upgrade);
+        subscribe(s.sku, s.offer, s.upgrade, presetToken);
     }
 
-    static void subscribe(final String sku, final String offer, final boolean upgrade) {
+    static void subscribe(final String sku, final String offer, final boolean upgrade, final String presetToken) {
         if (sku == null) { emit("缺少 sku"); return; }
         lastSku = sku;
         String offerId = (offer == null || offer.isEmpty()) ? "null" : offer;
@@ -381,6 +510,20 @@ public class Main implements IXposedHookLoadPackage {
 
         if (!upgrade) {
             pickAndLaunch(key, null);
+            return;
+        }
+        // ① 模块进程在本机读库取好的（不需要电脑 adb）
+        if (presetToken != null && presetToken.length() >= 40) {
+            emit("用模块本机取的 token（" + presetToken.length() + " 字符）");
+            pickAndLaunch(key, presetToken);
+            return;
+        }
+        // ② 从 app 自己的 Billing 回调里捡到的（零 root）
+        String h = harvested;
+        if (h != null && h.length() >= 40) {
+            emit("用 app 回调里捕获的 token（" + h.length() + " 字符"
+                    + (harvestedDoc == null ? "" : " · " + harvestedDoc) + "）");
+            pickAndLaunch(key, h);
             return;
         }
         queryPurchases(new TokenCb() {
